@@ -49,6 +49,56 @@ app.post("/register", async (req, res) => {
       });
     }
 
+    // 🔐 LOGIN (gera token JWT)
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email e senha obrigatórios." });
+    }
+
+    // Hash da senha enviada
+    const password_hash = crypto
+      .createHash("sha256")
+      .update(password)
+      .digest("hex");
+
+    // Busca empresa pelo email
+    const userRes = await pool.query(
+      "SELECT id, name, email, password_hash FROM companies WHERE email = $1",
+      [email]
+    );
+
+    if (userRes.rows.length === 0) {
+      return res.status(401).json({ error: "Credenciais inválidas." });
+    }
+
+    const user = userRes.rows[0];
+
+    if (user.password_hash !== password_hash) {
+      return res.status(401).json({ error: "Credenciais inválidas." });
+    }
+
+    // Gerar token JWT
+    const jwt = require("jsonwebtoken");
+    const token = jwt.sign(
+      { id: user.id, email: user.email },
+      process.env.JWT_SECRET,
+      { expiresIn: "2h" }
+    );
+
+    return res.json({
+      message: "Login realizado com sucesso",
+      token,
+      user: { id: user.id, name: user.name, email: user.email }
+    });
+  } catch (e) {
+    console.error("❌ /login error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
     // Simples (MVP). Depois a gente troca por bcrypt + JWT.
     const password_hash = crypto.createHash("sha256").update(password).digest("hex");
 
