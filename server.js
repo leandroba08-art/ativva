@@ -15,6 +15,29 @@ app.use(express.json());
 
 
 // =========================
+// MIDDLEWARE DE AUTENTICAÇÃO
+// =========================
+const authMiddleware = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    return res.status(401).json({ error: "Token não fornecido" });
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || "segredo");
+
+    req.user = decoded; // usuário autenticado
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "Token inválido" });
+  }
+};
+
+
+// =========================
 // ROTA RAIZ
 // =========================
 app.get("/", (req, res) => {
@@ -25,6 +48,7 @@ app.get("/", (req, res) => {
       health: "GET /health",
       register: "POST /register",
       login: "POST /login",
+      me: "GET /me (protegida)",
       companies: "GET /companies",
       webhook: "POST /webhook/:companyKey",
     },
@@ -46,7 +70,7 @@ app.get("/health", async (req, res) => {
 
 
 // =========================
-// REGISTER (criar empresa)
+// REGISTER
 // =========================
 app.post("/register", async (req, res) => {
   try {
@@ -86,7 +110,7 @@ app.post("/register", async (req, res) => {
 
 
 // =========================
-// LOGIN CORRETO (APENAS 1 VEZ)
+// LOGIN
 // =========================
 app.post("/login", async (req, res) => {
   try {
@@ -145,6 +169,17 @@ app.post("/login", async (req, res) => {
 
 
 // =========================
+// ROTA PROTEGIDA /ME
+// =========================
+app.get("/me", authMiddleware, (req, res) => {
+  res.json({
+    message: "Usuário autenticado",
+    user: req.user,
+  });
+});
+
+
+// =========================
 // LISTAR EMPRESAS
 // =========================
 app.get("/companies", async (req, res) => {
@@ -193,6 +228,7 @@ app.post("/webhook/:companyKey", async (req, res) => {
     const aiReply =
       response.choices?.[0]?.message?.content?.trim() || "Sem resposta.";
 
+    // Salva conversa
     await pool.query(
       `INSERT INTO conversations (company_id, user_message, ai_response)
        VALUES ($1, $2, $3)`,
