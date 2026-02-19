@@ -195,3 +195,65 @@ const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, () => {
   console.log(`🔥 Servidor rodando na porta ${PORT}`);
 });
+
+// ==========================
+// LOGIN
+// ==========================
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: "Informe email e password" });
+    }
+
+    // Hash da senha enviada
+    const password_hash = crypto
+      .createHash("sha256")
+      .update(password)
+      .digest("hex");
+
+    // Buscar usuário na tabela companies
+    const result = await pool.query(
+      "SELECT id, name, email, password_hash, company_key FROM companies WHERE email = $1",
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Email não encontrado" });
+    }
+
+    const user = result.rows[0];
+
+    // Comparar hash
+    if (user.password_hash !== password_hash) {
+      return res.status(401).json({ error: "Senha incorreta" });
+    }
+
+    // Gerar token JWT (opcional)
+    const token = jwt.sign(
+      {
+        id: user.id,
+        email: user.email,
+        company_key: user.company_key,
+      },
+      process.env.JWT_SECRET || "segredo",
+      { expiresIn: "7d" }
+    );
+
+    return res.json({
+      message: "Login realizado com sucesso",
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        company_key: user.company_key,
+      },
+      token,
+    });
+
+  } catch (e) {
+    console.error("Erro no login:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
