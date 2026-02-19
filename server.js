@@ -29,7 +29,7 @@ const authMiddleware = (req, res, next) => {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET || "segredo");
 
-    req.user = decoded; // usuário autenticado
+    req.user = decoded; 
     next();
   } catch (e) {
     return res.status(401).json({ error: "Token inválido" });
@@ -48,9 +48,9 @@ app.get("/", (req, res) => {
       health: "GET /health",
       register: "POST /register",
       login: "POST /login",
-      me: "GET /me (protegida)",
-      companies: "GET /companies",
-      webhook: "POST /webhook/:companyKey",
+      me: "GET /me (protected)",
+      companies: "GET /companies (protected)",
+      webhook: "POST /webhook/:companyKey (secured with API Key)",
     },
   });
 });
@@ -70,7 +70,7 @@ app.get("/health", async (req, res) => {
 
 
 // =========================
-// REGISTER
+// REGISTER (gera API KEY)
 // =========================
 app.post("/register", async (req, res) => {
   try {
@@ -92,11 +92,14 @@ app.post("/register", async (req, res) => {
       .replace(/\s+/g, "-")
       .replace(/[^a-z0-9\-]/g, "")}-${Date.now()}`;
 
+    // gerar API key
+    const api_key = `ativva_sk_${crypto.randomBytes(16).toString("hex")}`;
+
     const result = await pool.query(
-      `INSERT INTO companies (name, email, password_hash, company_key, prompt)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, name, email, company_key, prompt, created_at`,
-      [name, email, password_hash, company_key, prompt]
+      `INSERT INTO companies (name, email, password_hash, company_key, prompt, api_key)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, name, email, company_key, prompt, api_key, created_at`,
+      [name, email, password_hash, company_key, prompt, api_key]
     );
 
     res.json({ company: result.rows[0] });
@@ -126,7 +129,7 @@ app.post("/login", async (req, res) => {
       .digest("hex");
 
     const result = await pool.query(
-      "SELECT id, name, email, password_hash, company_key FROM companies WHERE email = $1",
+      "SELECT id, name, email, password_hash, company_key, api_key FROM companies WHERE email = $1",
       [email]
     );
 
@@ -157,6 +160,7 @@ app.post("/login", async (req, res) => {
         name: user.name,
         email: user.email,
         company_key: user.company_key,
+        api_key: user.api_key,
       },
       token,
     });
@@ -182,10 +186,10 @@ app.get("/me", authMiddleware, (req, res) => {
 // =========================
 // LISTAR EMPRESAS
 // =========================
-app.get("/companies", async (req, res) => {
+app.get("/companies", authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT id, name, email, company_key, created_at FROM companies ORDER BY id ASC"
+      "SELECT id, name, email, company_key, api_key, created_at FROM companies ORDER BY id ASC"
     );
     res.json(result.rows);
   } catch (e) {
@@ -195,7 +199,7 @@ app.get("/companies", async (req, res) => {
 
 
 // =========================
-// WEBHOOK IA
+// WEBHOOK (agora com API KEY)
 // =========================
 app.post("/webhook/:companyKey", async (req, res) => {
   try {
@@ -206,8 +210,9 @@ app.post("/webhook/:companyKey", async (req, res) => {
       return res.status(400).json({ error: "Campo obrigatório: message" });
     }
 
+    // verificar empresa
     const companyRes = await pool.query(
-      "SELECT id, name, prompt FROM companies WHERE company_key = $1",
+      "SELECT id, name, prompt, api_key FROM companies WHERE company_key = $1",
       [companyKey]
     );
 
@@ -217,6 +222,18 @@ app.post("/webhook/:companyKey", async (req, res) => {
 
     const company = companyRes.rows[0];
 
+    // validar API key recebida
+    const clientApiKey = req.headers["x-api-key"];
+
+    if (!clientApiKey) {
+      return res.status(401).json({ error: "API Key não fornecida" });
+    }
+
+    if (clientApiKey !== company.api_key) {
+      return res.status(403).json({ error: "API Key inválida" });
+    }
+
+    // chamada real à IA
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -228,7 +245,6 @@ app.post("/webhook/:companyKey", async (req, res) => {
     const aiReply =
       response.choices?.[0]?.message?.content?.trim() || "Sem resposta.";
 
-    // Salva conversa
     await pool.query(
       `INSERT INTO conversations (company_id, user_message, ai_response)
        VALUES ($1, $2, $3)`,
