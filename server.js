@@ -13,9 +13,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-
 // =========================
-// MIDDLEWARE DE AUTENTICAÇÃO
+// MIDDLEWARE DE AUTENTICAÇÃO (JWT)
 // =========================
 const authMiddleware = (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -28,14 +27,12 @@ const authMiddleware = (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET || "segredo");
-
-    req.user = decoded; 
+    req.user = decoded;
     next();
   } catch (e) {
     return res.status(401).json({ error: "Token inválido" });
   }
 };
-
 
 // =========================
 // ROTA RAIZ
@@ -50,11 +47,10 @@ app.get("/", (req, res) => {
       login: "POST /login",
       me: "GET /me (protected)",
       companies: "GET /companies (protected)",
-      webhook: "POST /webhook/:companyKey (secured with API Key)",
+      webhook: "POST /webhook/:companyKey (secured with X-API-KEY)",
     },
   });
 });
-
 
 // =========================
 // HEALTHCHECK
@@ -68,9 +64,8 @@ app.get("/health", async (req, res) => {
   }
 });
 
-
 // =========================
-// REGISTER (gera API KEY)
+// REGISTER (gera COMPANY KEY + API KEY)
 // =========================
 app.post("/register", async (req, res) => {
   try {
@@ -110,7 +105,6 @@ app.post("/register", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
 
 // =========================
 // LOGIN
@@ -164,13 +158,11 @@ app.post("/login", async (req, res) => {
       },
       token,
     });
-
   } catch (e) {
     console.error("Erro no login:", e);
     res.status(500).json({ error: e.message });
   }
 });
-
 
 // =========================
 // ROTA PROTEGIDA /ME
@@ -182,9 +174,8 @@ app.get("/me", authMiddleware, (req, res) => {
   });
 });
 
-
 // =========================
-// LISTAR EMPRESAS
+// LISTAR EMPRESAS (PROTEGIDO)
 // =========================
 app.get("/companies", authMiddleware, async (req, res) => {
   try {
@@ -197,96 +188,21 @@ app.get("/companies", authMiddleware, async (req, res) => {
   }
 });
 
-
 // =========================
-// WEBHOOK (agora com API KEY)
+// WEBHOOK (SECURED COM API KEY)
+// Header obrigatório: x-api-key: <api_key da empresa>
+// Body: { "message": "...", "phone": "..." (opcional) }
 // =========================
-// ✅ Webhook com arquitetura profissional
 app.post("/webhook/:companyKey", async (req, res) => {
   try {
     const { companyKey } = req.params;
     const { phone, message } = req.body;
 
-    if (!phone || !message) {
-      return res.status(400).json({
-        error: "Campos obrigatórios: phone, message"
-      });
+    if (!message) {
+      return res.status(400).json({ error: "Campo obrigatório: message" });
     }
 
-    // 1️⃣ Buscar empresa
-    const companyRes = await pool.query(
-      "SELECT id, name, prompt FROM companies WHERE company_key = $1",
-      [companyKey]
-    );
-
-    if (companyRes.rows.length === 0) {
-      return res.status(404).json({ error: "company_key inválida" });
-    }
-
-    const company = companyRes.rows[0];
-
-    // 2️⃣ Verificar se já existe conversa aberta para o telefone
-    let conversationRes = await pool.query(
-      `SELECT id FROM conversations
-       WHERE company_id = $1 AND user_phone = $2 AND status = 'open'
-       LIMIT 1`,
-      [company.id, phone]
-    );
-
-    let conversationId;
-
-    if (conversationRes.rows.length === 0) {
-      // Criar nova conversa
-      const newConversation = await pool.query(
-        `INSERT INTO conversations (company_id, user_phone)
-         VALUES ($1, $2)
-         RETURNING id`,
-        [company.id, phone]
-      );
-
-      conversationId = newConversation.rows[0].id;
-    } else {
-      conversationId = conversationRes.rows[0].id;
-    }
-
-    // 3️⃣ Salvar mensagem do usuário
-    await pool.query(
-      `INSERT INTO messages (conversation_id, sender, content)
-       VALUES ($1, 'user', $2)`,
-      [conversationId, message]
-    );
-
-    // 4️⃣ Gerar resposta IA
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: company.prompt },
-        { role: "user", content: message },
-      ],
-    });
-
-    const aiReply =
-      response.choices?.[0]?.message?.content?.trim() || "Sem resposta.";
-
-    // 5️⃣ Salvar resposta da IA
-    await pool.query(
-      `INSERT INTO messages (conversation_id, sender, content)
-       VALUES ($1, 'ai', $2)`,
-      [conversationId, aiReply]
-    );
-
-    return res.json({
-      conversation_id: conversationId,
-      reply: aiReply,
-    });
-
-  } catch (e) {
-    console.error("Erro no webhook:", e);
-    return res.status(500).json({ error: e.message });
-  }
-});
-
-    // verificar empresa
+    // 1) Buscar empresa + api_key
     const companyRes = await pool.query(
       "SELECT id, name, prompt, api_key FROM companies WHERE company_key = $1",
       [companyKey]
@@ -298,18 +214,18 @@ app.post("/webhook/:companyKey", async (req, res) => {
 
     const company = companyRes.rows[0];
 
-    // validar API key recebida
+    // 2) Validar API Key recebida
     const clientApiKey = req.headers["x-api-key"];
 
     if (!clientApiKey) {
-      return res.status(401).json({ error: "API Key não fornecida" });
+      return res.status(401).json({ error: "API Key não fornecida (use header x-api-key)" });
     }
 
     if (clientApiKey !== company.api_key) {
       return res.status(403).json({ error: "API Key inválida" });
     }
 
-    // chamada real à IA
+    // 3) Chamar IA
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -321,21 +237,69 @@ app.post("/webhook/:companyKey", async (req, res) => {
     const aiReply =
       response.choices?.[0]?.message?.content?.trim() || "Sem resposta.";
 
-    await pool.query(
-      `INSERT INTO conversations (company_id, user_message, ai_response)
-       VALUES ($1, $2, $3)`,
-      [company.id, message, aiReply]
-    );
+    // 4) Persistência: tenta modelo novo (conversations + messages)
+    //    Se não existir no seu banco ainda, faz fallback para modelo antigo (conversations com user_message/ai_response).
+    const safePhone = phone || "unknown";
 
-    res.json({
-      company: { id: company.id, name: company.name },
-      reply: aiReply,
-    });
+    try {
+      // Tenta achar conversa aberta (modelo novo)
+      const conversationRes = await pool.query(
+        `SELECT id FROM conversations
+         WHERE company_id = $1 AND user_phone = $2 AND status = 'open'
+         LIMIT 1`,
+        [company.id, safePhone]
+      );
+
+      let conversationId;
+
+      if (conversationRes.rows.length === 0) {
+        const newConversation = await pool.query(
+          `INSERT INTO conversations (company_id, user_phone, status)
+           VALUES ($1, $2, 'open')
+           RETURNING id`,
+          [company.id, safePhone]
+        );
+        conversationId = newConversation.rows[0].id;
+      } else {
+        conversationId = conversationRes.rows[0].id;
+      }
+
+      // Mensagem user
+      await pool.query(
+        `INSERT INTO messages (conversation_id, sender, content)
+         VALUES ($1, 'user', $2)`,
+        [conversationId, message]
+      );
+
+      // Mensagem IA
+      await pool.query(
+        `INSERT INTO messages (conversation_id, sender, content)
+         VALUES ($1, 'ai', $2)`,
+        [conversationId, aiReply]
+      );
+
+      return res.json({
+        conversation_id: conversationId,
+        reply: aiReply,
+      });
+    } catch (dbNewModelError) {
+      // Fallback (modelo antigo)
+      await pool.query(
+        `INSERT INTO conversations (company_id, user_message, ai_response)
+         VALUES ($1, $2, $3)`,
+        [company.id, message, aiReply]
+      );
+
+      return res.json({
+        reply: aiReply,
+        note: "Salvo no modelo legado (conversations.user_message/ai_response).",
+      });
+    }
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("Erro no webhook:", e);
+    return res.status(500).json({ error: e.message });
   }
 });
-
 
 // =========================
 // 404
@@ -343,7 +307,6 @@ app.post("/webhook/:companyKey", async (req, res) => {
 app.use((req, res) => {
   res.status(404).json({ error: "Rota não encontrada" });
 });
-
 
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, () => {
