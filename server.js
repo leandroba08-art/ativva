@@ -201,14 +201,90 @@ app.get("/companies", authMiddleware, async (req, res) => {
 // =========================
 // WEBHOOK (agora com API KEY)
 // =========================
+// ✅ Webhook com arquitetura profissional
 app.post("/webhook/:companyKey", async (req, res) => {
   try {
     const { companyKey } = req.params;
-    const { message } = req.body;
+    const { phone, message } = req.body;
 
-    if (!message) {
-      return res.status(400).json({ error: "Campo obrigatório: message" });
+    if (!phone || !message) {
+      return res.status(400).json({
+        error: "Campos obrigatórios: phone, message"
+      });
     }
+
+    // 1️⃣ Buscar empresa
+    const companyRes = await pool.query(
+      "SELECT id, name, prompt FROM companies WHERE company_key = $1",
+      [companyKey]
+    );
+
+    if (companyRes.rows.length === 0) {
+      return res.status(404).json({ error: "company_key inválida" });
+    }
+
+    const company = companyRes.rows[0];
+
+    // 2️⃣ Verificar se já existe conversa aberta para o telefone
+    let conversationRes = await pool.query(
+      `SELECT id FROM conversations
+       WHERE company_id = $1 AND user_phone = $2 AND status = 'open'
+       LIMIT 1`,
+      [company.id, phone]
+    );
+
+    let conversationId;
+
+    if (conversationRes.rows.length === 0) {
+      // Criar nova conversa
+      const newConversation = await pool.query(
+        `INSERT INTO conversations (company_id, user_phone)
+         VALUES ($1, $2)
+         RETURNING id`,
+        [company.id, phone]
+      );
+
+      conversationId = newConversation.rows[0].id;
+    } else {
+      conversationId = conversationRes.rows[0].id;
+    }
+
+    // 3️⃣ Salvar mensagem do usuário
+    await pool.query(
+      `INSERT INTO messages (conversation_id, sender, content)
+       VALUES ($1, 'user', $2)`,
+      [conversationId, message]
+    );
+
+    // 4️⃣ Gerar resposta IA
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: company.prompt },
+        { role: "user", content: message },
+      ],
+    });
+
+    const aiReply =
+      response.choices?.[0]?.message?.content?.trim() || "Sem resposta.";
+
+    // 5️⃣ Salvar resposta da IA
+    await pool.query(
+      `INSERT INTO messages (conversation_id, sender, content)
+       VALUES ($1, 'ai', $2)`,
+      [conversationId, aiReply]
+    );
+
+    return res.json({
+      conversation_id: conversationId,
+      reply: aiReply,
+    });
+
+  } catch (e) {
+    console.error("Erro no webhook:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
 
     // verificar empresa
     const companyRes = await pool.query(
