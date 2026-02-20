@@ -23,15 +23,28 @@ const authMiddleware = (req, res, next) => {
     return res.status(401).json({ error: "Token não fornecido" });
   }
 
-  const token = authHeader.split(" ")[1];
+  const parts = authHeader.split(" ");
+  if (parts.length !== 2 || parts[0] !== "Bearer") {
+    return res.status(401).json({ error: "Formato do token inválido. Use: Bearer <token>" });
+  }
+
+  const token = parts[1];
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET || "segredo");
-    req.user = decoded;
+    req.user = decoded; // { id, email, company_key, iat, exp }
     next();
   } catch (e) {
     return res.status(401).json({ error: "Token inválido" });
   }
+};
+
+// =========================
+// HELPER: garantir isolamento por empresa (multi-tenant)
+// =========================
+const getCompanyIdFromToken = (req) => {
+  // No seu login, você assina token com { id: user.id } (onde user.id = companies.id)
+  return Number(req.user?.id);
 };
 
 // =========================
@@ -47,7 +60,13 @@ app.get("/", (req, res) => {
       login: "POST /login",
       me: "GET /me (protected)",
       companies: "GET /companies (protected)",
-      webhook: "POST /webhook/:companyKey (secured with X-API-KEY)",
+      webhook: "POST /webhook/:companyKey (x-api-key + body phone/message)",
+
+      // Atendimento Humano (Painel)
+      conversations: "GET /conversations?status=open (protected)",
+      conversationMessages: "GET /conversations/:id/messages (protected)",
+      assignConversation: "PUT /conversations/:id/assign (protected)",
+      sendManualMessage: "POST /conversations/:id/messages (protected)",
     },
   });
 });
@@ -65,7 +84,7 @@ app.get("/health", async (req, res) => {
 });
 
 // =========================
-// REGISTER (gera COMPANY KEY + API KEY)
+// REGISTER (gera company_key + api_key)
 // =========================
 app.post("/register", async (req, res) => {
   try {
@@ -87,7 +106,6 @@ app.post("/register", async (req, res) => {
       .replace(/\s+/g, "-")
       .replace(/[^a-z0-9\-]/g, "")}-${Date.now()}`;
 
-    // gerar API key
     const api_key = `ativva_sk_${crypto.randomBytes(16).toString("hex")}`;
 
     const result = await pool.query(
@@ -175,7 +193,7 @@ app.get("/me", authMiddleware, (req, res) => {
 });
 
 // =========================
-// LISTAR EMPRESAS (PROTEGIDO)
+// LISTAR EMPRESAS (protegido)
 // =========================
 app.get("/companies", authMiddleware, async (req, res) => {
   try {
@@ -189,20 +207,20 @@ app.get("/companies", authMiddleware, async (req, res) => {
 });
 
 // =========================
-// WEBHOOK (SECURED COM API KEY)
-// Header obrigatório: x-api-key: <api_key da empresa>
-// Body: { "message": "...", "phone": "..." (opcional) }
+// WEBHOOK (x-api-key) + Conversas/Mensagens
 // =========================
 app.post("/webhook/:companyKey", async (req, res) => {
   try {
     const { companyKey } = req.params;
     const { phone, message } = req.body;
 
-    if (!message) {
-      return res.status(400).json({ error: "Campo obrigatório: message" });
+    if (!phone || !message) {
+      return res.status(400).json({
+        error: "Campos obrigatórios: phone, message",
+      });
     }
 
-    // 1) Buscar empresa + api_key
+    // 1) Buscar empresa (inclui api_key)
     const companyRes = await pool.query(
       "SELECT id, name, prompt, api_key FROM companies WHERE company_key = $1",
       [companyKey]
@@ -214,19 +232,48 @@ app.post("/webhook/:companyKey", async (req, res) => {
 
     const company = companyRes.rows[0];
 
-    // 2) Validar API Key recebida
+    // 2) Validar API key recebida
     const clientApiKey = req.headers["x-api-key"];
-
     if (!clientApiKey) {
       return res.status(401).json({ error: "API Key não fornecida (use header x-api-key)" });
     }
-
     if (clientApiKey !== company.api_key) {
       return res.status(403).json({ error: "API Key inválida" });
     }
 
-    // 3) Chamar IA
-    const response = await openai.chat.completions.create({
+    // 3) Verificar/abrir conversa
+    let conversationRes = await pool.query(
+      `SELECT id FROM conversations
+       WHERE company_id = $1 AND user_phone = $2 AND status = 'open'
+       ORDER BY id DESC
+       LIMIT 1`,
+      [company.id, phone]
+    );
+
+    let conversationId;
+
+    if (conversationRes.rows.length === 0) {
+      const newConversation = await pool.query(
+        `INSERT INTO conversations (company_id, user_phone, status)
+         VALUES ($1, $2, 'open')
+         RETURNING id`,
+        [company.id, phone]
+      );
+
+      conversationId = newConversation.rows[0].id;
+    } else {
+      conversationId = conversationRes.rows[0].id;
+    }
+
+    // 4) Salvar mensagem do usuário
+    await pool.query(
+      `INSERT INTO messages (conversation_id, sender, content)
+       VALUES ($1, 'user', $2)`,
+      [conversationId, message]
+    );
+
+    // 5) Gerar resposta IA
+    const ai = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         { role: "system", content: company.prompt },
@@ -234,69 +281,163 @@ app.post("/webhook/:companyKey", async (req, res) => {
       ],
     });
 
-    const aiReply =
-      response.choices?.[0]?.message?.content?.trim() || "Sem resposta.";
+    const aiReply = ai.choices?.[0]?.message?.content?.trim() || "Sem resposta.";
 
-    // 4) Persistência: tenta modelo novo (conversations + messages)
-    //    Se não existir no seu banco ainda, faz fallback para modelo antigo (conversations com user_message/ai_response).
-    const safePhone = phone || "unknown";
+    // 6) Salvar resposta IA
+    await pool.query(
+      `INSERT INTO messages (conversation_id, sender, content)
+       VALUES ($1, 'ai', $2)`,
+      [conversationId, aiReply]
+    );
 
-    try {
-      // Tenta achar conversa aberta (modelo novo)
-      const conversationRes = await pool.query(
-        `SELECT id FROM conversations
-         WHERE company_id = $1 AND user_phone = $2 AND status = 'open'
-         LIMIT 1`,
-        [company.id, safePhone]
-      );
-
-      let conversationId;
-
-      if (conversationRes.rows.length === 0) {
-        const newConversation = await pool.query(
-          `INSERT INTO conversations (company_id, user_phone, status)
-           VALUES ($1, $2, 'open')
-           RETURNING id`,
-          [company.id, safePhone]
-        );
-        conversationId = newConversation.rows[0].id;
-      } else {
-        conversationId = conversationRes.rows[0].id;
-      }
-
-      // Mensagem user
-      await pool.query(
-        `INSERT INTO messages (conversation_id, sender, content)
-         VALUES ($1, 'user', $2)`,
-        [conversationId, message]
-      );
-
-      // Mensagem IA
-      await pool.query(
-        `INSERT INTO messages (conversation_id, sender, content)
-         VALUES ($1, 'ai', $2)`,
-        [conversationId, aiReply]
-      );
-
-      return res.json({
-        conversation_id: conversationId,
-        reply: aiReply,
-      });
-    } catch (dbNewModelError) {
-      // Fallback (modelo antigo)
-      await pool.query(
-        `INSERT INTO conversations (company_id, user_message, ai_response)
-         VALUES ($1, $2, $3)`,
-        [company.id, message, aiReply]
-      );
-
-      return res.json({
-        reply: aiReply,
-        note: "Salvo no modelo legado (conversations.user_message/ai_response).",
-      });
-    }
+    return res.json({
+      conversation_id: conversationId,
+      reply: aiReply,
+    });
   } catch (e) {
     console.error("Erro no webhook:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// =======================================================
+// ✅ ATENDIMENTO HUMANO (Painel) - ROTAS PROTEGIDAS (JWT)
+// =======================================================
+
+// 1) Listar conversas da empresa
+app.get("/conversations", authMiddleware, async (req, res) => {
+  try {
+    const companyId = getCompanyIdFromToken(req);
+    const { status } = req.query;
+
+    // filtro opcional por status
+    if (status) {
+      const r = await pool.query(
+        `SELECT id, company_id, user_phone, status, assigned_attendant_id, created_at
+         FROM conversations
+         WHERE company_id = $1 AND status = $2
+         ORDER BY id DESC`,
+        [companyId, String(status)]
+      );
+      return res.json(r.rows);
+    }
+
+    const result = await pool.query(
+      `SELECT id, company_id, user_phone, status, assigned_attendant_id, created_at
+       FROM conversations
+       WHERE company_id = $1
+       ORDER BY id DESC`,
+      [companyId]
+    );
+
+    return res.json(result.rows);
+  } catch (e) {
+    console.error("Erro ao listar conversas:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// 2) Listar mensagens de uma conversa
+app.get("/conversations/:id/messages", authMiddleware, async (req, res) => {
+  try {
+    const companyId = getCompanyIdFromToken(req);
+    const conversationId = Number(req.params.id);
+
+    // garante que a conversa pertence à empresa
+    const conv = await pool.query(
+      `SELECT id FROM conversations WHERE id = $1 AND company_id = $2`,
+      [conversationId, companyId]
+    );
+    if (conv.rows.length === 0) {
+      return res.status(404).json({ error: "Conversa não encontrada para esta empresa" });
+    }
+
+    const result = await pool.query(
+      `SELECT id, conversation_id, sender, content, created_at
+       FROM messages
+       WHERE conversation_id = $1
+       ORDER BY id ASC`,
+      [conversationId]
+    );
+
+    return res.json(result.rows);
+  } catch (e) {
+    console.error("Erro ao listar mensagens:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// 3) Atribuir conversa a um atendente (assumir)
+app.put("/conversations/:id/assign", authMiddleware, async (req, res) => {
+  try {
+    const companyId = getCompanyIdFromToken(req);
+    const conversationId = Number(req.params.id);
+    const { attendant_id } = req.body;
+
+    if (!attendant_id) {
+      return res.status(400).json({ error: "attendant_id é obrigatório" });
+    }
+
+    // garante que a conversa é da empresa
+    const updated = await pool.query(
+      `UPDATE conversations
+       SET assigned_attendant_id = $1,
+           status = 'human'
+       WHERE id = $2 AND company_id = $3
+       RETURNING id, company_id, user_phone, status, assigned_attendant_id, created_at`,
+      [Number(attendant_id), conversationId, companyId]
+    );
+
+    if (updated.rows.length === 0) {
+      return res.status(404).json({ error: "Conversa não encontrada para esta empresa" });
+    }
+
+    return res.json({
+      message: "Conversa atribuída ao atendente",
+      conversation: updated.rows[0],
+    });
+  } catch (e) {
+    console.error("Erro ao atribuir conversa:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// 4) Enviar mensagem manual como atendente
+app.post("/conversations/:id/messages", authMiddleware, async (req, res) => {
+  try {
+    const companyId = getCompanyIdFromToken(req);
+    const conversationId = Number(req.params.id);
+    const { content } = req.body;
+
+    if (!content) {
+      return res.status(400).json({ error: "content é obrigatório" });
+    }
+
+    // garante que a conversa pertence à empresa
+    const conv = await pool.query(
+      `SELECT id, user_phone, status FROM conversations WHERE id = $1 AND company_id = $2`,
+      [conversationId, companyId]
+    );
+    if (conv.rows.length === 0) {
+      return res.status(404).json({ error: "Conversa não encontrada para esta empresa" });
+    }
+
+    // salva mensagem do atendente
+    const msg = await pool.query(
+      `INSERT INTO messages (conversation_id, sender, content)
+       VALUES ($1, 'attendant', $2)
+       RETURNING id, conversation_id, sender, content, created_at`,
+      [conversationId, content]
+    );
+
+    // (FUTURO) Aqui entra: enviar essa mensagem pro WhatsApp
+
+    return res.json({
+      message: "Mensagem enviada pelo atendente",
+      sent: msg.rows[0],
+    });
+  } catch (e) {
+    console.error("Erro ao enviar mensagem do atendente:", e);
     return res.status(500).json({ error: e.message });
   }
 });
