@@ -35,9 +35,10 @@ async function sendZapiMessage(phone, text) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      "client-token": process.env.ZAPI_CLIENT_TOKEN, // 👈 minúsculo obrigatório
     },
     body: JSON.stringify({
-      phone,
+      phone: phone,
       message: text,
     }),
   });
