@@ -41,36 +41,75 @@ async function sendZapiMessage(phone, text) {
   const data = await response.json();
 
   if (!response.ok) {
-    throw new Error("Erro Z-API: " + JSON.stringify(data));
+    console.error("Erro envio Z-API:", data);
+    throw new Error("Erro Z-API");
   }
 
   return data;
 }
 
 // =========================
+// ROOT
+// =========================
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "ativva-api" });
+});
+
+// =========================
+// HEALTH
+// =========================
+app.get("/health", async (req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ ok: true });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// =========================
 // WEBHOOK Z-API
 // =========================
 app.post("/zapi/webhook", async (req, res) => {
   try {
-    res.sendStatus(200);
+    console.log("📩 ZAPI PAYLOAD:", JSON.stringify(req.body, null, 2));
+
+    res.sendStatus(200); // responde rápido
 
     const body = req.body;
 
-    if (!body?.phone || !body?.message) return;
+    // 🔎 Ajuste automático para diferentes formatos
+    const phone =
+      body.phone ||
+      body.from ||
+      body?.data?.phone ||
+      body?.data?.from;
 
-    const phone = body.phone;
-    const message = body.message;
+    const message =
+      body.message ||
+      body.body ||
+      body?.text?.message ||
+      body?.data?.message ||
+      body?.data?.text?.message;
 
-    // MVP: pegar primeira empresa
+    if (!phone || !message) {
+      console.log("⚠️ Payload ignorado");
+      return;
+    }
+
+    // =========================
+    // BUSCAR EMPRESA (MVP: primeira)
+    // =========================
     const companyRes = await pool.query(
       "SELECT * FROM companies ORDER BY id ASC LIMIT 1"
     );
 
     if (!companyRes.rows.length) return;
-
     const company = companyRes.rows[0];
 
-    // Buscar ou criar conversa
+    // =========================
+    // BUSCAR OU CRIAR CONVERSA
+    // =========================
     let conv = await pool.query(
       `SELECT id,status FROM conversations
        WHERE company_id=$1 AND user_phone=$2
@@ -94,12 +133,16 @@ app.post("/zapi/webhook", async (req, res) => {
       currentStatus = conv.rows[0].status;
     }
 
+    // Salvar mensagem usuário
     await pool.query(
       `INSERT INTO messages (conversation_id,sender,content)
        VALUES ($1,'user',$2)`,
       [conversationId, message]
     );
 
+    // =========================
+    // SE JÁ ESTÁ HUMANO
+    // =========================
     if (currentStatus === "human") {
       await sendZapiMessage(
         phone,
@@ -108,7 +151,9 @@ app.post("/zapi/webhook", async (req, res) => {
       return;
     }
 
-    // CLASSIFICAÇÃO
+    // =========================
+    // CLASSIFICAÇÃO IA
+    // =========================
     const classification = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -134,10 +179,13 @@ app.post("/zapi/webhook", async (req, res) => {
         phone,
         "Vou transferir você para um atendente humano."
       );
+
       return;
     }
 
-    // IA responde
+    // =========================
+    // RESPOSTA IA
+    // =========================
     const ai = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -156,22 +204,18 @@ app.post("/zapi/webhook", async (req, res) => {
     );
 
     await sendZapiMessage(phone, reply);
+
   } catch (e) {
-    console.error("Erro Z-API webhook:", e);
+    console.error("❌ Erro Z-API webhook:", e);
   }
 });
 
 // =========================
-// HEALTH
+// 404
 // =========================
-app.get("/health", async (req, res) => {
-  try {
-    await pool.query("SELECT 1");
-    res.json({ ok: true });
-  } catch (e) {
-    res.json({ ok: false, error: e.message });
-  }
+app.use((req, res) => {
+  res.status(404).json({ error: "Rota não encontrada" });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Servidor rodando na porta " + PORT));
+app.listen(PORT, () => console.log("🔥 Servidor rodando na porta " + PORT));
