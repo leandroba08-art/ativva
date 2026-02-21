@@ -1,14 +1,14 @@
+require("dotenv").config();
+
+const express = require("express");   
+const cors = require("cors");
+const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const pool = require("./db");
 
 const OpenAI = require("openai");
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
 
 const app = express();
-app.use(cors());
-app.use(express.json());
 
 // =============================
 // CONFIGURAÇÕES Z-API
