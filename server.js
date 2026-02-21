@@ -1,3 +1,7 @@
+console.log("ZAPI_INSTANCE_ID:", process.env.ZAPI_INSTANCE_ID);
+console.log("ZAPI_TOKEN:", process.env.ZAPI_TOKEN ? "OK" : "MISSING");
+console.log("ZAPI_CLIENT_TOKEN:", process.env.ZAPI_CLIENT_TOKEN ? "OK" : "MISSING");
+
 require("dotenv").config();
 
 const express = require("express");
