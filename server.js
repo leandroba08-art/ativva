@@ -382,6 +382,9 @@ app.post("/zapi/webhook", async (req, res) => {
     );
 
     // 3) DECISÃO IA vs HUMANO (✅ aqui é o ponto do seu problema)
+    console.log("DEBUG CONVERSATION:");
+console.log("status:", status);
+console.log("assigned_attendant_id:", assignedAttendantId);
     const shouldUseHuman = status !== "open" || assignedAttendantId !== null;
 
     if (shouldUseHuman) {
