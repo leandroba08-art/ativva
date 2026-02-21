@@ -15,190 +15,83 @@ app.use(express.json());
 
 const jwtSecret = process.env.JWT_SECRET || "segredo";
 
+const ZAPI_INSTANCE_ID = process.env.ZAPI_INSTANCE_ID;
+const ZAPI_TOKEN = process.env.ZAPI_TOKEN;
+
 // =========================
 // HELPERS
 // =========================
 const sha256 = (text) =>
   crypto.createHash("sha256").update(text).digest("hex");
 
-// =========================
-// AUTH EMPRESA
-// =========================
-const authMiddleware = (req, res, next) => {
-  const auth = req.headers.authorization;
-  if (!auth) return res.status(401).json({ error: "Token não fornecido" });
+async function sendZapiMessage(phone, text) {
+  const url = `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_TOKEN}/send-text`;
 
-  const token = auth.split(" ")[1];
-
-  try {
-    req.user = jwt.verify(token, jwtSecret);
-    next();
-  } catch {
-    res.status(401).json({ error: "Token inválido" });
-  }
-};
-
-// =========================
-// AUTH ATENDENTE
-// =========================
-const attendantAuth = (req, res, next) => {
-  const auth = req.headers.authorization;
-  if (!auth) return res.status(401).json({ error: "Token não fornecido" });
-
-  const token = auth.split(" ")[1];
-
-  try {
-    const decoded = jwt.verify(token, jwtSecret);
-    if (decoded.type !== "attendant")
-      return res.status(403).json({ error: "Token inválido para atendente" });
-
-    req.attendant = decoded;
-    next();
-  } catch {
-    res.status(401).json({ error: "Token inválido" });
-  }
-};
-
-// =========================
-// ROOT
-// =========================
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "ativva-api",
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      phone,
+      message: text,
+    }),
   });
-});
 
-// =========================
-// HEALTH
-// =========================
-app.get("/health", async (req, res) => {
-  try {
-    await pool.query("SELECT 1");
-    res.json({ ok: true });
-  } catch (e) {
-    res.json({ ok: false, error: e.message });
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error("Erro Z-API: " + JSON.stringify(data));
   }
-});
+
+  return data;
+}
 
 // =========================
-// REGISTER EMPRESA
+// WEBHOOK Z-API
 // =========================
-app.post("/register", async (req, res) => {
+app.post("/zapi/webhook", async (req, res) => {
   try {
-    const { name, email, password, prompt } = req.body;
+    res.sendStatus(200);
 
-    const password_hash = sha256(password);
+    const body = req.body;
 
-    const company_key =
-      name.toLowerCase().replace(/\s+/g, "-") + "-" + Date.now();
+    if (!body?.phone || !body?.message) return;
 
-    const api_key =
-      "ativva_sk_" + crypto.randomBytes(16).toString("hex");
+    const phone = body.phone;
+    const message = body.message;
 
-    const result = await pool.query(
-      `INSERT INTO companies
-       (name,email,password_hash,company_key,prompt,api_key)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       RETURNING id,name,email,company_key,api_key`,
-      [name, email, password_hash, company_key, prompt, api_key]
-    );
-
-    res.json(result.rows[0]);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// =========================
-// LOGIN EMPRESA
-// =========================
-app.post("/login", async (req, res) => {
-  const { email, password } = req.body;
-  const password_hash = sha256(password);
-
-  const result = await pool.query(
-    "SELECT * FROM companies WHERE email = $1",
-    [email]
-  );
-
-  if (!result.rows.length)
-    return res.status(404).json({ error: "Email não encontrado" });
-
-  const user = result.rows[0];
-
-  if (user.password_hash !== password_hash)
-    return res.status(401).json({ error: "Senha incorreta" });
-
-  const token = jwt.sign(
-    { id: user.id, company_key: user.company_key },
-    jwtSecret,
-    { expiresIn: "7d" }
-  );
-
-  res.json({
-    token,
-    company_key: user.company_key,
-    api_key: user.api_key,
-  });
-});
-
-// =========================
-// WEBHOOK COM IA DECISÃO
-// =========================
-app.post("/webhook/:companyKey", async (req, res) => {
-  try {
-    const { companyKey } = req.params;
-    const { phone, message } = req.body;
-
+    // MVP: pegar primeira empresa
     const companyRes = await pool.query(
-      "SELECT * FROM companies WHERE company_key = $1",
-      [companyKey]
+      "SELECT * FROM companies ORDER BY id ASC LIMIT 1"
     );
 
-    if (!companyRes.rows.length)
-      return res.status(404).json({ error: "company_key inválida" });
+    if (!companyRes.rows.length) return;
 
     const company = companyRes.rows[0];
 
-    if (req.headers["x-api-key"] !== company.api_key)
-      return res.status(403).json({ error: "API Key inválida" });
-
-    // CLASSIFICAÇÃO
-    const classification = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            'Responda apenas com HUMAN ou AI. HUMAN se cliente quiser atendente.',
-        },
-        { role: "user", content: message },
-      ],
-    });
-
-    const decision =
-      classification.choices[0].message.content.trim().toUpperCase();
-
-    // BUSCAR/CRIAR CONVERSA
+    // Buscar ou criar conversa
     let conv = await pool.query(
-      `SELECT id FROM conversations
+      `SELECT id,status FROM conversations
        WHERE company_id=$1 AND user_phone=$2
        ORDER BY id DESC LIMIT 1`,
       [company.id, phone]
     );
 
     let conversationId;
+    let currentStatus;
 
     if (!conv.rows.length) {
       const newConv = await pool.query(
         `INSERT INTO conversations (company_id,user_phone,status)
-         VALUES ($1,$2,'open') RETURNING id`,
+         VALUES ($1,$2,'open') RETURNING id,status`,
         [company.id, phone]
       );
       conversationId = newConv.rows[0].id;
+      currentStatus = newConv.rows[0].status;
     } else {
       conversationId = conv.rows[0].id;
+      currentStatus = conv.rows[0].status;
     }
 
     await pool.query(
@@ -207,19 +100,44 @@ app.post("/webhook/:companyKey", async (req, res) => {
       [conversationId, message]
     );
 
+    if (currentStatus === "human") {
+      await sendZapiMessage(
+        phone,
+        "Um atendente humano irá responder você em instantes."
+      );
+      return;
+    }
+
+    // CLASSIFICAÇÃO
+    const classification = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            'Responda apenas HUMAN ou AI. HUMAN se cliente quiser atendente.',
+        },
+        { role: "user", content: message },
+      ],
+    });
+
+    const decision =
+      classification.choices[0].message.content.trim().toUpperCase();
+
     if (decision === "HUMAN") {
       await pool.query(
         `UPDATE conversations SET status='human' WHERE id=$1`,
         [conversationId]
       );
 
-      return res.json({
-        handoff: true,
-        message: "Vou transferir você para um atendente humano.",
-      });
+      await sendZapiMessage(
+        phone,
+        "Vou transferir você para um atendente humano."
+      );
+      return;
     }
 
-    // RESPONDER IA
+    // IA responde
     const ai = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -237,39 +155,22 @@ app.post("/webhook/:companyKey", async (req, res) => {
       [conversationId, reply]
     );
 
-    res.json({ handoff: false, reply });
+    await sendZapiMessage(phone, reply);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("Erro Z-API webhook:", e);
   }
 });
 
 // =========================
-// ENCERRAR CONVERSA
+// HEALTH
 // =========================
-app.put("/conversations/:id/close", authMiddleware, async (req, res) => {
-  await pool.query(
-    "UPDATE conversations SET status='closed' WHERE id=$1",
-    [req.params.id]
-  );
-  res.json({ message: "Conversa encerrada" });
-});
-
-// =========================
-// REABRIR CONVERSA
-// =========================
-app.put("/conversations/:id/reopen", authMiddleware, async (req, res) => {
-  await pool.query(
-    "UPDATE conversations SET status='open' WHERE id=$1",
-    [req.params.id]
-  );
-  res.json({ message: "Conversa reaberta" });
-});
-
-// =========================
-// 404
-// =========================
-app.use((req, res) => {
-  res.status(404).json({ error: "Rota não encontrada" });
+app.get("/health", async (req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ ok: true });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
