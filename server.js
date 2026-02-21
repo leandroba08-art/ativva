@@ -1,24 +1,53 @@
 require("dotenv").config();
 
-const express = require("express");   
+const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const pool = require("./db");
-
 const OpenAI = require("openai");
 
 const app = express();
 
+app.use(cors());
+
+// 🔥 IMPORTANTE — suporta JSON e text/plain (Z-API)
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
+
+// 🔥 Força parsing se vier text/plain
+app.use((req, res, next) => {
+  if (req.headers["content-type"]?.includes("text/plain")) {
+    let data = "";
+    req.on("data", chunk => {
+      data += chunk;
+    });
+    req.on("end", () => {
+      try {
+        req.body = JSON.parse(data);
+      } catch {
+        req.body = {};
+      }
+      next();
+    });
+  } else {
+    next();
+  }
+});
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
 // =============================
-// CONFIGURAÇÕES Z-API
+// CONFIG Z-API
 // =============================
 const ZAPI_INSTANCE_ID = process.env.ZAPI_INSTANCE_ID;
 const ZAPI_INSTANCE_TOKEN = process.env.ZAPI_INSTANCE_TOKEN;
 const ZAPI_CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN;
 
 // =============================
-// FUNÇÃO ENVIO Z-API
+// ENVIO Z-API
 // =============================
 async function sendZapiMessage(phone, message) {
   const url = `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_INSTANCE_TOKEN}/send-text`;
@@ -46,7 +75,7 @@ async function sendZapiMessage(phone, message) {
 }
 
 // =============================
-// AUTH MIDDLEWARE
+// AUTH
 // =============================
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -70,7 +99,7 @@ app.get("/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
     res.json({ ok: true });
-  } catch (e) {
+  } catch {
     res.status(500).json({ ok: false });
   }
 });
@@ -133,10 +162,7 @@ app.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Senha incorreta" });
 
     const token = jwt.sign(
-      {
-        id: user.id,
-        company_key: user.company_key,
-      },
+      { id: user.id, company_key: user.company_key },
       process.env.JWT_SECRET,
       { expiresIn: "7d" }
     );
@@ -152,7 +178,7 @@ app.post("/login", async (req, res) => {
 // =============================
 app.post("/zapi/webhook", async (req, res) => {
   try {
-    console.log("📩 ZAPI PAYLOAD:", JSON.stringify(req.body, null, 2));
+    console.log("📩 ZAPI PAYLOAD:", req.body);
 
     const phone = req.body?.phone;
     const incomingText = req.body?.text?.message;
@@ -161,11 +187,9 @@ app.post("/zapi/webhook", async (req, res) => {
       return res.status(200).json({ ignored: true });
     }
 
-    const DEFAULT_COMPANY_KEY = process.env.DEFAULT_COMPANY_KEY;
-
     const companyRes = await pool.query(
-      "SELECT id, prompt FROM companies WHERE company_key = $1",
-      [DEFAULT_COMPANY_KEY]
+      "SELECT id,prompt FROM companies WHERE company_key=$1",
+      [process.env.DEFAULT_COMPANY_KEY]
     );
 
     if (!companyRes.rows.length)
@@ -173,44 +197,40 @@ app.post("/zapi/webhook", async (req, res) => {
 
     const company = companyRes.rows[0];
 
-    // BUSCA CONVERSA
     let conversationRes = await pool.query(
       `SELECT * FROM conversations
-       WHERE company_id = $1 AND user_phone = $2
+       WHERE company_id=$1 AND user_phone=$2
        ORDER BY id DESC LIMIT 1`,
       [company.id, phone]
     );
 
     let conversationId;
-    let conversationStatus = "open";
+    let status = "open";
     let assignedAttendant = null;
 
     if (!conversationRes.rows.length) {
       const newConversation = await pool.query(
         `INSERT INTO conversations (company_id,user_phone,status)
-         VALUES ($1,$2,'open')
-         RETURNING *`,
+         VALUES ($1,$2,'open') RETURNING *`,
         [company.id, phone]
       );
 
       conversationId = newConversation.rows[0].id;
     } else {
       conversationId = conversationRes.rows[0].id;
-      conversationStatus = conversationRes.rows[0].status;
+      status = conversationRes.rows[0].status;
       assignedAttendant =
         conversationRes.rows[0].assigned_attendant_id;
     }
 
-    // SALVA MSG USUÁRIO
     await pool.query(
       `INSERT INTO messages (conversation_id,sender,content)
        VALUES ($1,'user',$2)`,
       [conversationId, incomingText]
     );
 
-    // DECISÃO IA vs HUMANO
     const useHuman =
-      conversationStatus !== "open" || assignedAttendant !== null;
+      status !== "open" || assignedAttendant !== null;
 
     if (useHuman) {
       const humanMessage =
@@ -227,7 +247,6 @@ app.post("/zapi/webhook", async (req, res) => {
       return res.json({ mode: "human" });
     }
 
-    // RESPOSTA IA
     const aiResponse = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -247,26 +266,10 @@ app.post("/zapi/webhook", async (req, res) => {
 
     await sendZapiMessage(phone, aiReply);
 
-    return res.json({ mode: "ai", reply: aiReply });
+    return res.json({ mode: "ai" });
   } catch (e) {
     console.error("Erro webhook:", e);
     return res.status(500).json({ error: e.message });
-  }
-});
-
-// =============================
-// ENCERRAR CONVERSA
-// =============================
-app.post("/conversations/:id/close", authMiddleware, async (req, res) => {
-  try {
-    await pool.query(
-      `UPDATE conversations SET status='closed' WHERE id=$1`,
-      [req.params.id]
-    );
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
   }
 });
 
